@@ -88,10 +88,11 @@ pollreactor_free(struct pollreactor *pr)
 
 // Add a callback for when a file descriptor (fd) becomes readable
 static void
-pollreactor_add_fd(struct pollreactor *pr, int pos, int fd, void *callback)
+pollreactor_add_fd(struct pollreactor *pr, int pos, int fd, void *callback
+                   , int write_only)
 {
     pr->fds[pos].fd = fd;
-    pr->fds[pos].events = POLLIN|POLLHUP;
+    pr->fds[pos].events = POLLHUP | (write_only ? 0 : POLLIN);
     pr->fds[pos].revents = 0;
     pr->fd_callbacks[pos] = callback;
 }
@@ -391,6 +392,7 @@ struct serialqueue {
 
 #define MIN_RTO 0.025
 #define MAX_RTO 5.000
+#define MAX_PENDING_BLOCKS 12
 #define MIN_REQTIME_DELTA 0.250
 #define MIN_BACKGROUND_DELTA 0.005
 #define IDLE_QUERY_TIME 1.0
@@ -501,18 +503,21 @@ update_receive_seq(struct serialqueue *sq, double eventtime, uint64_t rseq)
 }
 
 // Process a well formed input message
-static void
+static int
 handle_message(struct serialqueue *sq, double eventtime, int len)
 {
     // Calculate receive sequence number
     uint64_t rseq = ((sq->receive_seq & ~MESSAGE_SEQ_MASK)
                      | (sq->input_buf[MESSAGE_POS_SEQ] & MESSAGE_SEQ_MASK));
-    if (rseq < sq->receive_seq)
-        rseq += MESSAGE_SEQ_MASK+1;
-
-    if (rseq != sq->receive_seq)
+    if (rseq != sq->receive_seq) {
         // New sequence number
+        if (rseq < sq->receive_seq)
+            rseq += MESSAGE_SEQ_MASK+1;
+        if (rseq > sq->send_seq && sq->receive_seq != 1)
+            // An ack for a message not sent?  Out of order message?
+            return -1;
         update_receive_seq(sq, eventtime, rseq);
+    }
 
     // Check for pending messages on notify_queue
     int must_wake = 0;
@@ -552,6 +557,7 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
 
     if (must_wake)
         check_wake_receive(sq);
+    return 0;
 }
 
 // Callback for input activity on the serial fd
@@ -567,26 +573,29 @@ input_event(struct serialqueue *sq, double eventtime)
     }
     sq->input_pos += ret;
     for (;;) {
-        ret = check_message(&sq->need_sync, sq->input_buf, sq->input_pos);
-        if (!ret)
+        int len = check_message(&sq->need_sync, sq->input_buf, sq->input_pos);
+        if (!len)
             // Need more data
             return;
-        if (ret > 0) {
+        if (len > 0) {
             // Received a valid message
             pthread_mutex_lock(&sq->lock);
-            handle_message(sq, eventtime, ret);
-            sq->bytes_read += ret;
+            int ret = handle_message(sq, eventtime, len);
+            if (ret)
+                sq->bytes_invalid += len;
+            else
+                sq->bytes_read += len;
             pthread_mutex_unlock(&sq->lock);
         } else {
             // Skip bad data at beginning of input
-            ret = -ret;
+            len = -len;
             pthread_mutex_lock(&sq->lock);
-            sq->bytes_invalid += ret;
+            sq->bytes_invalid += len;
             pthread_mutex_unlock(&sq->lock);
         }
-        sq->input_pos -= ret;
+        sq->input_pos -= len;
         if (sq->input_pos)
-            memmove(sq->input_buf, &sq->input_buf[ret], sq->input_pos);
+            memmove(sq->input_buf, &sq->input_buf[len], sq->input_pos);
     }
 }
 
@@ -725,7 +734,7 @@ build_and_send_command(struct serialqueue *sq, double eventtime)
 static double
 check_send_command(struct serialqueue *sq, double eventtime)
 {
-    if (sq->send_seq - sq->receive_seq >= MESSAGE_SEQ_MASK
+    if (sq->send_seq - sq->receive_seq >= MAX_PENDING_BLOCKS
         && sq->receive_seq != (uint64_t)-1)
         // Need an ack before more messages can be sent
         return PR_NEVER;
@@ -838,9 +847,9 @@ serialqueue_alloc(int serial_fd, int write_only)
     if (ret)
         goto fail;
     pollreactor_setup(&sq->pr, SQPF_NUM, SQPT_NUM, sq);
-    if (!write_only)
-        pollreactor_add_fd(&sq->pr, SQPF_SERIAL, serial_fd, input_event);
-    pollreactor_add_fd(&sq->pr, SQPF_PIPE, sq->pipe_fds[0], kick_event);
+    pollreactor_add_fd(&sq->pr, SQPF_SERIAL, serial_fd, input_event
+                       , write_only);
+    pollreactor_add_fd(&sq->pr, SQPF_PIPE, sq->pipe_fds[0], kick_event, 0);
     pollreactor_add_timer(&sq->pr, SQPT_RETRANSMIT, retransmit_event);
     pollreactor_add_timer(&sq->pr, SQPT_COMMAND, command_event);
     set_non_blocking(serial_fd);
